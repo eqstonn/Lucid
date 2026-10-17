@@ -28,10 +28,14 @@
       titlePrefix: /^\s*(?:my\s+)?(?:grades|content|lessons|course\s+content)\s*[-–|:]\s*/i,
     },
     grades: {
-      tables: ["table", "[role='table']", "[role='grid']"],
+      // D2L: <d2l-table-wrapper> slots a light-DOM <table id="z_a" class="d2l-table d2l-grid">.
+      // The generic selectors stay as fallbacks; matches are unioned, so overlap is harmless.
+      tables: ["d2l-table-wrapper table", "table#z_a", "table.d2l-table", "table", "[role='table']", "[role='grid']"],
+      // Item names sit in th > div.dco > ... > label; prefer the label's text when a cell has one.
+      cellLabel: "label",
       rows: ["tr", "[role='row']"],
-      cells: ["th", "td", "[role='rowheader']", "[role='gridcell']", "[role='cell']"],
-      nameCells: ["th", "[role='rowheader']", "td:first-child"],
+      // A row's own cells; column positions come from the "Grade Item" / "Points" headers.
+      cells: ["th", "td", "[role='columnheader']", "[role='rowheader']", "[role='gridcell']", "[role='cell']"],
     },
     syllabus: {
       // Where to look for candidate URLs: [css selector, attribute].
@@ -54,16 +58,64 @@
 
   // ---- pure helpers (unit-tested in content.test.js) -----------------------
 
-  const SCORE_RE = /(-|–|—|\d+(?:[.,]\d+)?)\s*\/\s*(\d+(?:[.,]\d+)?)/;
+  // First "[number or -] / [number]" anywhere in the cell; surrounding text, icons and line breaks are ignored.
+  // The lookbehind stops a match from starting mid-number ("1.5 / 2" must not yield "5 / 2").
+  const SCORE_RE = /(?<![\d.,])(\d+(?:[.,]\d+)?|[-–—])\s*\/\s*(\d+(?:[.,]\d+)?)/;
+  const DROPPED_RE = /dropped/i; // no \b: adjacent inline markup can glue it to the score ("30iDropped!")
 
-  /** "5.5 / 5.5" -> {score: 5.5, max: 5.5}; "- / 10" -> {score: null, max: 10}; no match -> null. */
+  const clean = (s) => String(s || "").replace(/\s+/g, " ").trim();
+  const firstLine = (s) => String(s || "").split(/\n+/).map(clean).find(Boolean) || "";
+
+  /** "5.5 / 5.5" -> {score: 5.5, max: 5.5}; "0 / 30\nDropped!" -> {score: 0, max: 30}; "- / 10" -> {score: null, max: 10}; no pattern -> null. */
   function parseScore(text) {
-    const m = SCORE_RE.exec(String(text || "").replace(/\s+/g, " "));
+    const m = SCORE_RE.exec(clean(text));
     if (!m) return null;
     const num = (s) => Number(s.replace(",", "."));
     const max = num(m[2]);
     if (!(max > 0)) return null;
     return { score: /^\d/.test(m[1]) ? num(m[1]) : null, max };
+  }
+
+  /** How many cells at the start of the row are blank (indentation spacers). */
+  function leadingBlanks(cells) {
+    let n = 0;
+    while (n < cells.length && !clean(cells[n])) n++;
+    return n;
+  }
+
+  /** Header cells -> {name, points} column indexes, or null if this isn't the header row. */
+  function locateColumns(cells) {
+    const heads = cells.map((c) => clean(c).toLowerCase());
+    const name = heads.findIndex((h) => /^grade item\b/.test(h));
+    const points = heads.findIndex((h) => /^points\b/.test(h));
+    return name >= 0 && points >= 0 ? { name, points } : null;
+  }
+
+  /**
+   * One table as rows of cell strings -> graded items. Columns come from the header row
+   * (Grade Item / Points), defaulting to 0 / 1. Only the Points column is read; rows whose
+   * Points cell has no "[number or -] / [number]" (category headers) are skipped.
+   * A dropped item ("0 / 30 Dropped!") is reported ungraded: it must not count as a zero.
+   */
+  function gradesFromRows(rows) {
+    let cols = { name: 0, points: 1 };
+    let headerBlanks = 0;
+    const out = [];
+    for (const cells of rows) {
+      const located = locateColumns(cells);
+      if (located) { cols = located; headerBlanks = leadingBlanks(cells); continue; }
+      // Indented child rows start with blank spacer cells that the header lacks: shift both columns right.
+      const shift = Math.max(0, leadingBlanks(cells) - headerBlanks);
+      const nameIdx = cols.name + shift;
+      const pointsIdx = cols.points + shift;
+      if (cells.length <= Math.max(nameIdx, pointsIdx)) continue;
+      const parsed = parseScore(cells[pointsIdx]);
+      const name = firstLine(cells[nameIdx]);
+      if (!parsed || !name) continue;
+      const dropped = DROPPED_RE.test(cells[pointsIdx]);
+      out.push({ name, score: dropped ? null : parsed.score, max: parsed.max });
+    }
+    return out;
   }
 
   function firstMatch(patterns, text) {
@@ -134,12 +186,7 @@
     return out;
   }
 
-  const clean = (s) => String(s || "").replace(/\s+/g, " ").trim();
   const cellText = (el) => clean(el.innerText || el.textContent);
-  const firstLine = (el) => {
-    const lines = String(el.innerText || el.textContent || "").split(/\n+/).map(clean).filter(Boolean);
-    return lines[0] || "";
-  };
 
   function getOrgId(url) {
     return firstMatch(CONFIG.orgId, url);
@@ -157,31 +204,48 @@
 
   // ---- Grade Scraper -------------------------------------------------------
 
+  /** The row's own cells only (direct children), so nested tables inside a cell don't leak in. */
+  function rowCells(row) {
+    const sel = CONFIG.grades.cells.join(",");
+    return Array.from(row.children).filter((el) => el.matches(sel));
+  }
+
+  /**
+   * A cell as text: the <label>'s text first (where D2L buries item names), then rendered text, then raw
+   * textContent as a safety net for markup innerText skips. Names take the first line; scores the first match.
+   */
+  function cellString(cell) {
+    const label = cell.querySelector(CONFIG.grades.cellLabel);
+    return [label && (label.innerText || label.textContent), cell.innerText, cell.textContent]
+      .filter(Boolean)
+      .join("\n");
+  }
+
   function scrapeGrades() {
     const g = CONFIG.grades;
     const found = [];
     const seen = new Set();
-    for (const table of deepQueryAll(document, g.tables.join(","))) {
-      for (const row of table.querySelectorAll(g.rows.join(","))) {
-        const cells = Array.from(row.querySelectorAll(g.cells.join(",")));
-        if (cells.length < 2) continue;
-        const nameCell = row.querySelector(g.nameCells.join(",")) || cells[0];
-        const name = firstLine(nameCell);
-        if (!name) continue;
-        let parsed = null;
-        for (const c of cells) {
-          if (c === nameCell) continue;
-          parsed = parseScore(cellText(c));
-          if (parsed) break;
-        }
-        if (!parsed) continue;
-        const key = name + "|" + parsed.score + "|" + parsed.max;
-        if (seen.has(key)) continue;
+    const tables = deepQueryAll(document, g.tables.join(","));
+    const sample = [];
+    for (const table of tables) {
+      const rowEls = Array.from(table.querySelectorAll(g.rows.join(",")));
+      const rows = rowEls.map((row) => rowCells(row).map(cellString));
+      // Diagnostics: the first rows after the header as "cellTags|first line of each cell", so a failing
+      // row layout (different tags, cell counts or stray text) is visible in the banner.
+      if (!sample.length) {
+        sample.push(...rowEls.slice(0, 8).map((row, i) =>
+          rowCells(row).map((c) => c.tagName.toLowerCase()).join(",") + " | " +
+          rows[i].map((c) => firstLine(c).slice(0, 24)).join(" ¦ ")));
+      }
+      for (const grade of gradesFromRows(rows)) {
+        const key = grade.name + "|" + grade.score + "|" + grade.max;
+        if (seen.has(key)) continue; // nested tables are also visited as their own table
         seen.add(key);
-        found.push({ name, score: parsed.score, max: parsed.max });
+        found.push(grade);
       }
     }
-    return found;
+    // Diagnostics for selector tuning when nothing is found.
+    return { grades: found, debug: { tables: tables.length, sample: sample.slice(0, 3) } };
   }
 
   // ---- Syllabus Hunter -----------------------------------------------------
@@ -220,12 +284,12 @@
   async function scrapePage() {
     const url = location.href;
     const base = { ok: true, orgId: getOrgId(url), courseName: getCourseName() };
-    if (CONFIG.pages.grades.test(url)) return { ...base, kind: "grades", grades: scrapeGrades() };
+    if (CONFIG.pages.grades.test(url)) return { ...base, kind: "grades", ...scrapeGrades() };
     if (CONFIG.pages.content.test(url)) return { ...base, kind: "content", ...(await huntSyllabus()) };
     return { ...base, kind: "other" };
   }
 
-  const api = { CONFIG, parseScore, classifyUrls, bytesToBase64, isPdf, getOrgId };
+  const api = { CONFIG, parseScore, locateColumns, gradesFromRows, classifyUrls, bytesToBase64, isPdf, getOrgId };
 
   if (typeof module !== "undefined" && module.exports) {
     module.exports = api;

@@ -154,7 +154,9 @@
         throw new Error("No grading scheme for this course yet. Open its syllabus on the Content page and press Sync first.");
       }
       if (!data.grades.length) {
-        throw new Error("No grades were found on this page. Selectors may need tuning in content.js.");
+        const d = data.debug || {};
+        throw new Error("No grades found (tables seen: " + (d.tables ?? "?") + "; first rows: " +
+          (d.sample || []).join(" // ").slice(0, 1200) + "). Selectors may need tuning in content.js.");
       }
       const { categories, matched, unmatched } = Grades.matchGrades(existing.categories, data.grades);
       existing.categories = categories;

@@ -7,12 +7,86 @@ const Grades = require("./js/grades.js");
 // ---- parseScore ----
 assert.deepEqual(content.parseScore("5.5 / 5.5"), { score: 5.5, max: 5.5 });
 assert.deepEqual(content.parseScore("5.5/5.5"), { score: 5.5, max: 5.5 });
-assert.deepEqual(content.parseScore("  85 / 100\n85 %"), { score: 85, max: 100 });
+assert.deepEqual(content.parseScore("  12 /\n 12 "), { score: 12, max: 12 });
+assert.deepEqual(content.parseScore("0 / 30\nDropped!"), { score: 0, max: 30 }); // trailing text ignored
+assert.deepEqual(content.parseScore("\n\n   23 / 30  ⓘ "), { score: 23, max: 30 }); // whitespace/icons ignored
+assert.deepEqual(content.parseScore("Points: 1.5 / 2 (75 %)"), { score: 1.5, max: 2 }); // not "5 / 2"
+assert.deepEqual(content.parseScore("\n  -  \n / 10\nNot yet graded"), { score: null, max: 10 });
+assert.equal(content.parseScore("0.5 %"), null);
+assert.equal(content.parseScore("n/a"), null);
 assert.deepEqual(content.parseScore("- / 10"), { score: null, max: 10 });
 assert.deepEqual(content.parseScore("7,5 / 10"), { score: 7.5, max: 10 });
 assert.equal(content.parseScore("85 %"), null);
 assert.equal(content.parseScore("3 / 0"), null);
 assert.equal(content.parseScore(""), null);
+
+// ---- grades table: columns by header, nested rows, category rows skipped ----
+assert.deepEqual(content.locateColumns(["Grade Item", "Points", "Weight Achieved", "Grade"]), { name: 0, points: 1 });
+assert.deepEqual(content.locateColumns(["", "Grade Item  Sort", "Weight Achieved", "Points"]), { name: 1, points: 3 });
+assert.equal(content.locateColumns(["Assignment 1", "12 / 12"]), null);
+const table = [
+  ["Grade Item", "Points", "Weight Achieved", "Grade"],
+  ["Labs", "", "4 / 10", "40 %"], // category: Points empty, weight column must be ignored
+  ["   Lab 1\n", "12 / 12", "2 / 5", "100 %"], // indented child
+  ["  Lab 2", "- / 10", "- / 5", "-"], // ungraded
+  ["Assignment 1", "0.5 / 0.5", "1 / 1", "100 %"], // flat
+  ["Assignments", "20 / 40", "5 / 10", "50 %"].map((c, i) => (i === 1 ? "" : c)),
+  ["Bonus", "n/a", "", ""],
+  ["Short row"],
+];
+assert.deepEqual(content.gradesFromRows(table), [
+  { name: "Lab 1", score: 12, max: 12 },
+  { name: "Lab 2", score: null, max: 10 },
+  { name: "Assignment 1", score: 0.5, max: 0.5 },
+]);
+// The MATH1005 grades page: innerText\ntextContent doubled cells, dropped item, category rows without points.
+const math = [
+  ["Grade Item", "Points", "Weight Achieved", "Grade", "Comments and Assessments"],
+  ["Term\nTerm", "", "25.5 / 45\n25.5 / 45", "56.67 %", ""],
+  ["Test 1\nTest 1", "23 / 30\n23 / 30", "11.5 / 15", "76.67 %", ""],
+  ["Test 3", "0 / 30 ⓘ\nDropped!\n0 / 30 Dropped!", "0 / 0", "0 %", ""],
+  ["Test 4", "0 / 30", "0 / 15", "0 %", ""],
+  ["Exam", "", "0 / 55", "0 %", ""],
+  ["Exam", "0 / 100", "0 / 55", "0 %", ""],
+];
+assert.deepEqual(content.gradesFromRows(math), [
+  { name: "Test 1", score: 23, max: 30 },
+  { name: "Test 3", score: null, max: 30 }, // dropped -> ungraded, not a zero
+  { name: "Test 4", score: 0, max: 30 },
+  { name: "Exam", score: 0, max: 100 },
+]);
+// Indented child rows carry a blank spacer cell first (6 cells vs the header's 5): columns shift right.
+const spaced = [
+  ["Grade Item", "Points", "Weight Achieved", "Grade", "Comments and Assessments"],
+  ["Term", "", "25.5 / 45", "56.67 %", ""],
+  ["", "Test 1", "23 / 30", "11.5 / 15", "76.67 %", ""],
+  ["  ", "Test 2", "28 / 30", "14 / 15", "93.33 %", ""],
+  ["", "Test 3", "0 / 30\nDropped!", "0 / 0", "0 %", ""],
+  ["", "", "Sub item", "4 / 5", "1 / 1", "80 %", ""], // two spacers
+  ["", "Test 4", "- / 30", "0 / 15", "0 %", ""],
+  ["Exam", "", "0 / 55", "0 %", ""],
+  ["", "Exam", "0 / 100", "0 / 55", "0 %", ""],
+];
+assert.deepEqual(content.gradesFromRows(spaced), [
+  { name: "Test 1", score: 23, max: 30 },
+  { name: "Test 2", score: 28, max: 30 },
+  { name: "Test 3", score: null, max: 30 },
+  { name: "Sub item", score: 4, max: 5 },
+  { name: "Test 4", score: null, max: 30 },
+  { name: "Exam", score: 0, max: 100 },
+]);
+// A header with its own leading blank column (e.g. a checkbox) must not cause a shift on data rows that share it.
+assert.deepEqual(
+  content.gradesFromRows([["", "Grade Item", "Points"], ["", "Quiz 1", "3 / 4"], ["", "", "Quiz 2", "1 / 4"]]),
+  [{ name: "Quiz 1", score: 3, max: 4 }, { name: "Quiz 2", score: 1, max: 4 }],
+);
+// No header row: standard order (name, points) is assumed.
+assert.deepEqual(content.gradesFromRows([["Quiz 1", "5.5 / 5.5", "x"]]), [{ name: "Quiz 1", score: 5.5, max: 5.5 }]);
+// Reordered columns are followed, and the Weight Achieved column is never used as points.
+assert.deepEqual(
+  content.gradesFromRows([["Weight Achieved", "Grade Item", "Points"], ["1 / 1", "Quiz 1", "- / 10"]]),
+  [{ name: "Quiz 1", score: null, max: 10 }],
+);
 
 // ---- org id ----
 assert.equal(content.getOrgId("https://brightspace.carleton.ca/d2l/lms/grades/my_grades/main.d2l?ou=123456"), "123456");
