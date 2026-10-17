@@ -1,15 +1,26 @@
-"""Syllabus text -> structured GradingCategory list via Claude (schema-enforced)."""
+"""Syllabus text -> structured GradingCategory list via Gemini (schema-enforced)."""
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Optional
 
-import anthropic
+import truststore
+from dotenv import load_dotenv
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types
+from pydantic import ValidationError
 
 from schemas import GradingCategory, ParseSyllabusResponse
 
-MODEL = "claude-opus-5-5"
-MAX_TOKENS = 16000
+# Verify TLS against the OS trust store: networks that inspect TLS (corporate proxies,
+# antivirus) install their root CA there, not in certifi's bundle.
+truststore.inject_into_ssl()
+load_dotenv(Path(__file__).with_name(".env"))
+
+MODEL = "gemini-3.8-flash"
 
 SYSTEM_PROMPT = """\
 You extract the grading scheme from a university course syllabus.
@@ -36,50 +47,60 @@ class ParseError(Exception):
     """Raised when the model response cannot be turned into grading categories."""
 
 
+def _get_client() -> genai.Client:
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise ParseError("GEMINI_API_KEY is not set (add it to backend/.env)")
+    return genai.Client(api_key=api_key)
+
+
 def parse_syllabus_text(
     text: str,
-    client: Optional[anthropic.Anthropic] = None,
+    client: Optional[genai.Client] = None,
 ) -> list[GradingCategory]:
-    """Send normalized syllabus text to Claude and return validated grading categories.
+    """Send normalized syllabus text to Gemini and return validated grading categories.
 
     Args:
         text: Output of ``extractor.extract_text_from_pdf``.
-        client: Optional preconfigured client (credentials resolve from the environment
-            when omitted). Injectable for testing.
+        client: Optional preconfigured client. Injectable for testing; by default one
+            is built from ``GEMINI_API_KEY`` (loaded from ``backend/.env``).
 
     Raises:
-        ParseError: empty input, refusal, truncation, or output failing the schema.
+        ParseError: empty input, missing key, API failure, blocked/truncated output,
+            or output failing the schema.
     """
     if not text.strip():
         raise ParseError("Syllabus text is empty")
 
-    api = client or anthropic.Anthropic()
+    api = client or _get_client()
     try:
-        response = api.messages.parse(
+        response = api.models.generate_content(
             model=MODEL,
-            max_tokens=MAX_TOKENS,
-            system=SYSTEM_PROMPT,
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"<syllabus>\n{text}\n</syllabus>\n\nExtract the grading scheme.",
-                }
-            ],
-            output_format=ParseSyllabusResponse,
+            contents=f"<syllabus>\n{text}\n</syllabus>\n\nExtract the grading scheme.",
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                temperature=0.0,
+                response_mime_type="application/json",
+                response_json_schema=ParseSyllabusResponse.model_json_schema(),
+            ),
         )
-    except anthropic.APIStatusError as exc:
-        raise ParseError(f"Claude API error ({exc.status_code}): {exc.message}") from exc
-    except anthropic.APIConnectionError as exc:
-        raise ParseError("Could not reach the Claude API") from exc
+    except genai_errors.APIError as exc:
+        raise ParseError(f"Gemini API error ({exc.code}): {exc.message}") from exc
 
-    if response.stop_reason == "refusal":
-        raise ParseError("Claude declined to process this document")
-    if response.stop_reason == "max_tokens":
+    candidates = response.candidates or []
+    finish = str(candidates[0].finish_reason) if candidates and candidates[0].finish_reason else ""
+    if "MAX_TOKENS" in finish:
         raise ParseError("Response was truncated before the grading scheme was complete")
-    parsed: Optional[ParseSyllabusResponse] = response.parsed_output
-    if parsed is None:
-        raise ParseError("Claude returned no structured output")
-    return parsed.categories
+
+    parsed = response.parsed
+    if isinstance(parsed, ParseSyllabusResponse):
+        return parsed.categories
+    if response.text:
+        try:
+            return ParseSyllabusResponse.model_validate_json(response.text).categories
+        except ValidationError as exc:
+            raise ParseError(f"Model output failed schema validation: {exc}") from exc
+    raise ParseError(f"Gemini returned no structured output (finish_reason={finish or 'unknown'})")
 
 
 if __name__ == "__main__":
@@ -89,16 +110,29 @@ if __name__ == "__main__":
         categories=[GradingCategory(name="Final Exam", weight=100.0)]
     )
 
-    class _Messages:
-        def parse(self, **kwargs: object) -> SimpleNamespace:
-            assert kwargs["output_format"] is ParseSyllabusResponse
-            return SimpleNamespace(stop_reason="end_turn", parsed_output=canned)
+    def _fake(parsed: object, text: Optional[str] = None, finish: str = "STOP") -> genai.Client:
+        def generate_content(**kwargs: object) -> SimpleNamespace:
+            config = kwargs["config"]
+            assert config.response_json_schema == ParseSyllabusResponse.model_json_schema()  # type: ignore[attr-defined]
+            return SimpleNamespace(
+                parsed=parsed, text=text, candidates=[SimpleNamespace(finish_reason=finish)]
+            )
 
-    fake = SimpleNamespace(messages=_Messages())
-    result = parse_syllabus_text("Final Exam 100%", client=fake)  # type: ignore[arg-type]
-    assert result == canned.categories
+        return SimpleNamespace(models=SimpleNamespace(generate_content=generate_content))  # type: ignore[return-value]
+
+    assert parse_syllabus_text("Final Exam 100%", client=_fake(canned)) == canned.categories
+    assert parse_syllabus_text(
+        "Final Exam 100%", client=_fake(None, text=canned.model_dump_json())
+    ) == canned.categories
+    for bad in (_fake(None), _fake(None, text="{not json"), _fake(canned, finish="FinishReason.MAX_TOKENS")):
+        try:
+            parse_syllabus_text("Final Exam 100%", client=bad)
+        except ParseError:
+            pass
+        else:
+            raise AssertionError("expected ParseError")
     try:
-        parse_syllabus_text("   ", client=fake)  # type: ignore[arg-type]
+        parse_syllabus_text("   ", client=_fake(canned))
     except ParseError:
         pass
     else:

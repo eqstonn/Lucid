@@ -1,20 +1,25 @@
-"""Phase 2 tests: PDF bytes -> normalized text -> GradingCategory models.
+"""Phase 2 tests: PDF bytes -> normalized text -> GradingCategory models (Gemini).
 
-Run offline (fake Claude client):   python -m pytest backend/test_phase2.py -v
-Also run the live Claude test:      set ANTHROPIC_API_KEY (or `ant auth login`) first.
+Run from backend/:  .venv\\Scripts\\python -m pytest test_phase2.py -v
+The live test needs GEMINI_API_KEY in backend/.env and is skipped without it.
 """
 
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 
 import pymupdf as fitz
 import pytest
+from dotenv import load_dotenv
 
 from extractor import ExtractionError, extract_text_from_pdf
 from parser import ParseError, parse_syllabus_text
 from schemas import GradingCategory, ParseSyllabusResponse
+
+load_dotenv(Path(__file__).with_name(".env"))
 
 SYLLABUS_LINES = [
     "CS 1010 - Introduction to Programming",
@@ -38,14 +43,18 @@ def make_pdf(lines: list[str]) -> bytes:
     return data
 
 
-def fake_client(parsed: ParseSyllabusResponse | None, stop_reason: str = "end_turn") -> SimpleNamespace:
+def fake_client(
+    parsed: Optional[ParseSyllabusResponse], finish_reason: str = "STOP", text: Optional[str] = None
+) -> SimpleNamespace:
     captured: dict[str, object] = {}
 
-    def parse(**kwargs: object) -> SimpleNamespace:
+    def generate_content(**kwargs: object) -> SimpleNamespace:
         captured.update(kwargs)
-        return SimpleNamespace(stop_reason=stop_reason, parsed_output=parsed)
+        return SimpleNamespace(
+            parsed=parsed, text=text, candidates=[SimpleNamespace(finish_reason=finish_reason)]
+        )
 
-    return SimpleNamespace(messages=SimpleNamespace(parse=parse), captured=captured)
+    return SimpleNamespace(models=SimpleNamespace(generate_content=generate_content), captured=captured)
 
 
 CANNED = ParseSyllabusResponse(
@@ -77,24 +86,31 @@ def test_rejects_non_pdf_and_textless_pdf() -> None:
         extract_text_from_pdf(blank.tobytes())
 
 
-def test_pdf_to_models_end_to_end_with_fake_claude() -> None:
+def test_pdf_to_models_end_to_end_with_fake_gemini() -> None:
     text = extract_text_from_pdf(make_pdf(SYLLABUS_LINES))
     client = fake_client(CANNED)
     categories = parse_syllabus_text(text, client=client)  # type: ignore[arg-type]
 
     assert all(isinstance(c, GradingCategory) for c in categories)
     assert sum(c.weight for c in categories) == 100
-    assert "Final Exam - 30%" in client.captured["messages"][0]["content"]  # type: ignore[index]
-    assert client.captured["output_format"] is ParseSyllabusResponse
+    assert "Final Exam - 30%" in client.captured["contents"]  # type: ignore[operator]
+    assert client.captured["config"].response_json_schema == ParseSyllabusResponse.model_json_schema()  # type: ignore[attr-defined]
+
+
+def test_falls_back_to_validating_raw_json_text() -> None:
+    client = fake_client(None, text=CANNED.model_dump_json())
+    assert parse_syllabus_text("Final Exam 30%", client=client) == CANNED.categories  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
-    ("parsed", "stop_reason"),
-    [(None, "end_turn"), (CANNED, "refusal"), (CANNED, "max_tokens")],
+    ("parsed", "finish", "text"),
+    [(None, "STOP", None), (None, "STOP", "{not json"), (CANNED, "FinishReason.MAX_TOKENS", None)],
 )
-def test_parse_failures_raise_parse_error(parsed: ParseSyllabusResponse | None, stop_reason: str) -> None:
+def test_parse_failures_raise_parse_error(
+    parsed: Optional[ParseSyllabusResponse], finish: str, text: Optional[str]
+) -> None:
     with pytest.raises(ParseError):
-        parse_syllabus_text("Final Exam 100%", client=fake_client(parsed, stop_reason))  # type: ignore[arg-type]
+        parse_syllabus_text("Final Exam 100%", client=fake_client(parsed, finish, text))  # type: ignore[arg-type]
 
 
 def test_schema_contract_rejects_bad_model_output() -> None:
@@ -104,12 +120,16 @@ def test_schema_contract_rejects_bad_model_output() -> None:
         GradingCategory.model_validate({"name": "X", "weight": 10, "items": [{"name": "Q", "score": 3}]})
 
 
-@pytest.mark.skipif(
-    not os.environ.get("ANTHROPIC_API_KEY"), reason="live test needs ANTHROPIC_API_KEY"
-)
-def test_live_claude_parses_sample_syllabus() -> None:
+@pytest.mark.skipif(not os.environ.get("GEMINI_API_KEY"), reason="live test needs GEMINI_API_KEY in backend/.env")
+def test_live_gemini_parses_sample_syllabus() -> None:
     categories = parse_syllabus_text(extract_text_from_pdf(make_pdf(SYLLABUS_LINES)))
-    by_name = {c.name.lower(): c for c in categories}
-    assert sum(c.weight for c in categories) == 100
-    assert any("final" in n for n in by_name)
-    assert all(i.score is None for c in categories for i in c.items)
+
+    assert all(isinstance(c, GradingCategory) for c in categories)
+    assert sum(c.weight for c in categories) == pytest.approx(100)
+    names = " ".join(c.name.lower() for c in categories)
+    for expected in ("quiz", "assignment", "midterm", "final"):
+        assert expected in names
+    assert all(i.score is None and i.max_score is None for c in categories for i in c.items)
+    quizzes = next(c for c in categories if "quiz" in c.name.lower())
+    assert quizzes.weight == pytest.approx(20)
+    assert len(quizzes.items) == 4
