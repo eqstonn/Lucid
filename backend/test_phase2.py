@@ -120,6 +120,69 @@ def test_schema_contract_rejects_bad_model_output() -> None:
         GradingCategory.model_validate({"name": "X", "weight": 10, "items": [{"name": "Q", "score": 3}]})
 
 
+BUCKET_LINES = [
+    "COMP 1805 Assessment Overview - bucket-based grading",
+    "Quizzes (10 x 5.5%) - available 55%, bucket capacity 50%",
+    "Tutorial Workshops (11 x 1.5%) - available 16.5%, bucket capacity 15%",
+    "Lecture Engagement - 12 opportunities, 1% each (12% available, capped at 10%)",
+    "Video Engagement - 11 weekly video groups, 0.5% per week (capped at 5%)",
+    "Final Exam - 20%",
+]
+
+BUCKET_CANNED = ParseSyllabusResponse(
+    categories=[
+        GradingCategory(
+            name="Quizzes", weight=50, item_weight=5.5, items=[{"name": f"Quiz {i}"} for i in range(1, 11)]
+        ),
+        GradingCategory(
+            name="Lecture Engagement",
+            weight=10,
+            item_weight=1,
+            items=[{"name": f"Lecture Engagement {i}"} for i in range(1, 13)],
+        ),
+        GradingCategory(
+            name="Video Engagement", weight=5, item_weight=0.5, items=[{"name": f"Video {i}"} for i in range(1, 12)]
+        ),
+        GradingCategory(name="Final Exam", weight=20, items=[{"name": "Final Exam"}]),
+    ]
+)
+
+
+def test_item_weight_round_trips_through_schema_and_parser() -> None:
+    assert GradingCategory(name="X", weight=10).item_weight is None
+    with pytest.raises(Exception):
+        GradingCategory(name="X", weight=10, item_weight=120)
+
+    client = fake_client(None, text=BUCKET_CANNED.model_dump_json())
+    cats = parse_syllabus_text("\n".join(BUCKET_LINES), client=client)  # type: ignore[arg-type]
+    assert cats == BUCKET_CANNED.categories
+    quizzes = cats[0]
+    assert quizzes.item_weight == 5.5 and quizzes.weight == 50 and len(quizzes.items) == 10
+    assert [len(c.items) for c in cats] == [10, 12, 11, 1]
+    # Model-facing JSON schema exposes the new field.
+    assert "item_weight" in client.captured["config"].response_json_schema["$defs"]["GradingCategory"]["properties"]  # type: ignore[attr-defined]
+
+
+def test_prompt_asks_for_item_weight_and_buried_item_counts() -> None:
+    client = fake_client(BUCKET_CANNED)
+    parse_syllabus_text("\n".join(BUCKET_LINES), client=client)  # type: ignore[arg-type]
+    prompt = client.captured["config"].system_instruction  # type: ignore[attr-defined]
+    assert "item_weight" in prompt
+    assert "aggressive" in prompt and "capacity" in prompt.lower()
+
+
+@pytest.mark.skipif(not os.environ.get("GEMINI_API_KEY"), reason="live test needs GEMINI_API_KEY in backend/.env")
+def test_live_gemini_extracts_bucket_items() -> None:
+    categories = parse_syllabus_text(extract_text_from_pdf(make_pdf(BUCKET_LINES)))
+    by_name = {c.name.lower(): c for c in categories}
+    lecture = next(c for n, c in by_name.items() if "lecture" in n)
+    video = next(c for n, c in by_name.items() if "video" in n)
+    quizzes = next(c for n, c in by_name.items() if "quiz" in n)
+    assert (len(lecture.items), lecture.item_weight, lecture.weight) == (12, 1, 10)
+    assert (len(video.items), video.item_weight, video.weight) == (11, 0.5, 5)
+    assert (len(quizzes.items), quizzes.item_weight, quizzes.weight) == (10, 5.5, 50)
+
+
 @pytest.mark.skipif(not os.environ.get("GEMINI_API_KEY"), reason="live test needs GEMINI_API_KEY in backend/.env")
 def test_live_gemini_parses_sample_syllabus() -> None:
     categories = parse_syllabus_text(extract_text_from_pdf(make_pdf(SYLLABUS_LINES)))

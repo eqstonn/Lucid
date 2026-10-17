@@ -121,6 +121,28 @@ def test_calculate_standing_12_of_15() -> None:
     assert body["guaranteed_floor"] == 12.0
 
 
+def _bucket_payload(scores: list[float]) -> dict[str, Any]:
+    items = [{"name": f"Quiz {n + 1}", "score": s, "max_score": 10} for n, s in enumerate(scores)]
+    items += [{"name": f"Quiz {n + 1}"} for n in range(len(scores), 10)]
+    return {"categories": [{"name": "Quizzes", "weight": 50, "item_weight": 5.5, "items": items}]}
+
+
+def test_calculate_standing_bucket_item_weight() -> None:
+    body = client.post("/api/calculate-standing", json=_bucket_payload([10, 10, 5, 5])).json()
+    assert body["points_earned"] == 16.5  # 5.5 + 5.5 + 2.75 + 2.75
+    assert body["evaluated_weight"] == 22.0
+    assert body["projected_grade"] == 75.0
+    assert body["progress_label"] == "16.5 / 22"
+
+
+def test_calculate_standing_bucket_is_capped_at_category_weight() -> None:
+    body = client.post("/api/calculate-standing", json=_bucket_payload([10] * 10)).json()
+    assert body["points_earned"] == 50.0  # 55% raw, capped at 50
+    assert body["evaluated_weight"] == 50.0
+    assert body["projected_grade"] == 100.0
+    assert body["guaranteed_floor"] == 50.0
+
+
 def test_calculate_standing_nothing_graded() -> None:
     payload = {"categories": [{"name": "Exam", "weight": 100, "items": [{"name": "Final"}]}]}
     body = client.post("/api/calculate-standing", json=payload).json()
@@ -135,6 +157,7 @@ def test_calculate_standing_nothing_graded() -> None:
         {"categories": [{"name": "X", "weight": 120}]},
         {"categories": [{"name": "X", "weight": 10, "items": [{"name": "Q", "score": 3}]}]},
         {"categories": [{"name": "X", "weight": 10, "surprise": 1}]},
+        {"categories": [{"name": "X", "weight": 10, "item_weight": -1}]},
     ],
 )
 def test_calculate_standing_invalid_payload_is_422(payload: dict[str, Any]) -> None:

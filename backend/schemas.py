@@ -35,12 +35,19 @@ class GradeItem(BaseModel):
 
 
 class GradingCategory(BaseModel):
-    """A group of grade items (e.g. "Quizzes") worth ``weight`` % of the course."""
+    """A group of grade items (e.g. "Quizzes") worth at most ``weight`` % of the course.
+
+    ``weight`` is the category's cap. For bucket grading, ``item_weight`` is the
+    % of the course each item is individually worth; the items may add up to more
+    than ``weight`` (10 quizzes x 5.5% = 55% in a 50% bucket) but the category's
+    contribution never exceeds ``weight``.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(min_length=1)
     weight: float = Field(ge=0, le=100)
+    item_weight: Optional[float] = Field(default=None, ge=0, le=100)
     items: list[GradeItem] = Field(default_factory=list)
 
 

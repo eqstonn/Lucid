@@ -29,16 +29,32 @@ Return every graded component grouped into categories (e.g. Quizzes, Assignments
 Midterm, Final Exam, Participation/Wooclap).
 
 Rules:
-- Category `weight` is the percent of the FINAL COURSE GRADE (0-100). Categories \
-should normally sum to 100; report what the syllabus states and do not rescale.
-- Item `weight` is the item's share of the FINAL COURSE GRADE in percent (e.g. one \
-of four equal quizzes in a 20% category has weight 5). If the syllabus does not \
-state per-item weights, leave `weight` null; do not guess.
-- Only list items the syllabus names or clearly implies (e.g. "4 quizzes" -> \
-"Quiz 1".."Quiz 4"). A category with no identifiable items has an empty `items` list.
+- Category `weight` is the percent of the FINAL COURSE GRADE (0-100) the category \
+can contribute at most. Under bucket grading this is the bucket CAPACITY (e.g. \
+"55% available, capped at 50%" -> weight 50), not the amount available. Report what \
+the syllabus states and do not rescale; categories may sum to over 100 when extra \
+buckets (bonus, revision recovery) are stated as "+N%".
+- Category `item_weight` is the percent of the FINAL COURSE GRADE that EACH item is \
+individually worth, when the syllabus states it (e.g. "10 x 5.5%" -> 5.5, "1.5% each" \
+-> 1.5, "0.5% per week" -> 0.5). Items may add up to MORE than the category weight; \
+that is expected, keep both numbers as stated. Leave `item_weight` null if no \
+per-item value is given.
+- Item `weight` is only for a single item whose own weight differs from its siblings. \
+Leave it null when `item_weight` applies or when per-item weights are not stated; \
+do not guess.
+- Be aggressive about item counts. Search the whole text, including descriptions, \
+tables and bullet points, for counts such as "11 weekly tutorials", "12 \
+lecture-engagement opportunities", "11 weekly video groups", "weekly quiz, weeks \
+2-11" (= 10), "N x P%". Create one item per counted unit with numbered names \
+("Quiz 1".."Quiz 10", "Lecture Engagement 1".."Lecture Engagement 12", \
+"Video 1".."Video 11"). Use the count of opportunities actually stated, not the \
+number of weeks in the term. Never leave a category's `items` empty if a count is \
+stated anywhere in the text.
+- A single exam or similar one-off component gets one item named after it. Only \
+leave `items` empty when no item or count can be identified.
 - `score` and `max_score` are always null: a syllabus has no student results.
-- If the syllabus gives best-of / drop-lowest rules, keep the plain listing and \
-ignore the rule; do not invent weights for it.
+- Best-of / drop-lowest / capped-bucket rules are expressed through `weight` (cap) \
+and `item_weight`; do not invent extra weights for them.
 - Never invent components that are not in the text.
 """
 
