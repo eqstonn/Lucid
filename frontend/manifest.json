@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Lucid",
+  "version": "0.2.0",
+  "description": "Brightspace grade & progress assistant.",
+  "permissions": ["sidePanel", "storage", "scripting"],
+  "host_permissions": ["http://localhost:8000/*", "*://brightspace.carleton.ca/*"],
+  "background": { "service_worker": "background.js" },
+  "side_panel": { "default_path": "sidepanel.html" },
+  "action": { "default_title": "Open Lucid" },
+  "content_scripts": [
+    {
+      "matches": ["*://brightspace.carleton.ca/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
